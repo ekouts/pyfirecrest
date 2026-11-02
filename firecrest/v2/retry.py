@@ -118,7 +118,10 @@ class RetryRule:
             if header is not None:
                 return parse_retry_after(header, log, self.retry_after_fallback)
 
-        delay = self.backoff_factor * (2 ** attempt)
+        # Beyond a few dozen doublings the delay is far above any sensible
+        # cap, and `2 ** attempt` would eventually overflow a float (an
+        # unlimited rule can reach attempt 1024), so cap the exponent
+        delay = self.backoff_factor * (2 ** min(attempt, 64))
         if self.jitter:
             delay *= random.uniform(0.5, 1.5)
 
