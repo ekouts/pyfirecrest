@@ -15,12 +15,20 @@ from firecrest.v2._sync.Client import (  # noqa
     ExternalUpload,
     Firecrest,
 )
+from firecrest.v2.retry import (  # noqa
+    DEFAULT_RETRY_RULES,
+    RetryPolicy,
+    RetryRule,
+)
 
 __all__ = [
     "AsyncExternalDownload",
     "AsyncExternalUpload",
     "AsyncFirecrest",
+    "DEFAULT_RETRY_RULES",
     "ExternalDownload",
     "ExternalUpload",
     "Firecrest",
+    "RetryPolicy",
+    "RetryRule",
 ]

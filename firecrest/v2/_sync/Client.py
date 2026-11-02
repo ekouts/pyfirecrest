@@ -20,13 +20,13 @@ import uuid
 
 from packaging.version import InvalidVersion, Version, parse
 from streamer import streamer_client as cli
-from typing import Any, BinaryIO, List, Optional
+from typing import Any, BinaryIO, Dict, List, Optional
 
 import firecrest.types as t
 
 from firecrest.tracing import current_correlation_id, ensure_correlation_id
+from firecrest.v2.retry import RetryPolicy, RetryRule, RuleKey
 from firecrest.utilities import (
-    parse_retry_after,
     part_checksum_xml,
     sched_state_completed,
     sched_state_running,
@@ -57,6 +57,14 @@ def handle_response(response):
         print(json.dumps(response.json(), indent=4))
     except json.JSONDecodeError:
         print("-")
+
+
+def _response_message(response: httpx.Response) -> str:
+    """The `message` field of a JSON error response, or an empty string."""
+    try:
+        return str(response.json().get("message", ""))
+    except Exception:
+        return ""
 
 
 def sleep_generator():
@@ -517,55 +525,110 @@ class Firecrest:
                    requests will verify the server’s TLS certificate,
                    or a string, in which case it must be a path to a CA bundle
                    to use
+    :param retry_policy: the :class:`firecrest.v2.RetryPolicy` that decides
+                         which failed requests are repeated and how. By
+                         default a policy with the
+                         :data:`firecrest.v2.retry.DEFAULT_RETRY_RULES` is used.
+                         It is also available (and editable) as the
+                         ``retry_policy`` attribute of the client.
     """
 
     TOO_MANY_REQUESTS_CODE = 429
     MAX_DIRECT_UPLOAD_SIZE = 1048576
 
-    def _retry_requests(func):
-        def wrapper(*args, **kwargs):
-            client = args[0]
-            num_retries = 0
-            resp = func(*args, **kwargs)
-            while True:
-                if resp.status_code != client.TOO_MANY_REQUESTS_CODE:
-                    break
-                elif (
-                    client.num_retries_rate_limit is not None
-                    and num_retries >= client.num_retries_rate_limit
-                ):
-                    client.log(
-                        logging.DEBUG,
-                        f"Rate limit is reached and the request has "
-                        f"been retried already {num_retries} times"
+    def _retry_requests(idempotent_default):
+        """Decorator of the request wrappers. The request is repeated
+        according to :attr:`retry_policy`: after every attempt the policy is
+        asked whether the response (or the transport error) should be
+        retried and how long to sleep before trying again. Each rule of the
+        policy has its own budget of retries.
+
+        The wrapper accepts an ``idempotent`` keyword argument (defaults to
+        ``idempotent_default``) that is consumed here, not passed to the
+        wrapped function, and tells the policy whether the request is safe
+        to repeat. The number of retries that were performed is stored in
+        ``response.extensions["firecrest_retries"]``.
+        """
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                client = args[0]
+                idempotent = kwargs.pop("idempotent", idempotent_default)
+                endpoint = kwargs.get("endpoint", "")
+                policy = client.retry_policy
+                retries: Dict[RuleKey, int] = {}
+                while True:
+                    try:
+                        resp = func(*args, **kwargs)
+                    except Exception as exc:
+                        match = policy.match(idempotent, exc=exc)
+                        if match is None:
+                            raise
+
+                        key, rule = match
+                        done = retries.get(key, 0)
+                        if rule.exhausted(done):
+                            client.log(
+                                logging.DEBUG,
+                                f"Request to {endpoint} failed with "
+                                f"{type(exc).__name__} and has been retried "
+                                f"already {done} times"
+                            )
+                            raise
+
+                        delay = rule.sleep_seconds(done, log=client.log)
+                        client.log(
+                            logging.INFO,
+                            f"Request to {endpoint} failed with "
+                            f"{type(exc).__name__}: {exc}. Will sleep for "
+                            f"{delay:.1f} seconds and try again (retry "
+                            f"{done + 1}/{rule.max_retries or 'unlimited'})"
+                        )
+                        time.sleep(delay)
+                        retries[key] = done + 1
+                        continue
+
+                    match = policy.match(idempotent, response=resp)
+                    if match is None:
+                        break
+
+                    key, rule = match
+                    done = retries.get(key, 0)
+                    if rule.exhausted(done):
+                        client.log(
+                            logging.DEBUG,
+                            f"Request to {endpoint} got status "
+                            f"{resp.status_code} and has been retried "
+                            f"already {done} times"
+                        )
+                        break
+
+                    delay = rule.sleep_seconds(
+                        done, response=resp, log=client.log
                     )
-                    break
-                else:
-                    reset = resp.headers.get(
-                        "Retry-After",
-                        default=resp.headers.get(
-                            "RateLimit-Reset", default=10
-                        ),
-                    )
-                    reset = parse_retry_after(reset, client.log)
                     client.log(
                         logging.INFO,
-                        f"Rate limit is reached, will sleep for "
-                        f"{reset} seconds and try again"
+                        f"Request to {endpoint} got status "
+                        f"{resp.status_code}. Will sleep for {delay:.1f} "
+                        f"seconds and try again (retry {done + 1}/"
+                        f"{rule.max_retries or 'unlimited'})"
                     )
-                    time.sleep(reset)
-                    resp = func(*args, **kwargs)
-                    num_retries += 1
+                    time.sleep(delay)
+                    retries[key] = done + 1
 
-            return resp
+                resp.extensions["firecrest_retries"] = sum(retries.values())
+                return resp
 
-        return wrapper
+            return wrapper
+
+        return decorator
 
     def __init__(
         self,
         firecrest_url: str,
         authorization: Any,
         verify: str | bool | ssl.SSLContext = True,
+        retry_policy: Optional[RetryPolicy] = None,
     ) -> None:
         self._firecrest_url = firecrest_url.rstrip('/')
         self._authorization = authorization
@@ -583,10 +646,14 @@ class Firecrest:
 
         #: Disable all logging from the client.
         self.disable_client_logging: bool = False
-        #: Number of retries in case the rate limit is reached. When it is set
-        #: to `None`, the client will keep trying until it gets a different
-        #: status code than 429.
-        self.num_retries_rate_limit: Optional[int] = None
+        #: The :class:`firecrest.v2.RetryPolicy` of the client: a table of
+        #: rules, keyed by HTTP status code or `httpx` exception class, that
+        #: decides which failed requests are repeated, how many times and
+        #: with which backoff. Edit it in place to tune the retries, e.g.
+        #: ``client.retry_policy.rules[503].max_retries = 10``.
+        self.retry_policy: RetryPolicy = (
+            retry_policy if retry_policy is not None else RetryPolicy()
+        )
         self._api_version: Version = parse("2.6.0")
         # Set to `True` when the user sets the version explicitly, in which
         # case the version detected from the response headers is ignored
@@ -647,6 +714,24 @@ class Firecrest:
         """Check if the httpx session is closed"""
         return self._session.is_closed
 
+    @property
+    def num_retries_rate_limit(self) -> Optional[int]:
+        """Number of retries in case the rate limit is reached. When it is
+        set to `None`, the client will keep trying until it gets a different
+        status code than 429. This is an alias of the ``max_retries`` of the
+        rule for status 429 in :attr:`retry_policy`.
+        """
+        rules = self.retry_policy.rules_for(429)
+        return rules[0].max_retries if rules else 0
+
+    @num_retries_rate_limit.setter
+    def num_retries_rate_limit(self, value: Optional[int]) -> None:
+        rules = self.retry_policy.rules_for(429)
+        if rules:
+            rules[0].max_retries = value
+        else:
+            self.retry_policy.rules[429] = RetryRule(max_retries=value)
+
     def log(self, level: int, msg: Any) -> None:
         """Log a message with the given level on the client logger.
         """
@@ -680,7 +765,7 @@ class Firecrest:
 
         return headers
 
-    @_retry_requests  # type: ignore
+    @_retry_requests(idempotent_default=True)  # type: ignore
     def _get_request(
         self,
         endpoint,
@@ -712,7 +797,7 @@ class Firecrest:
         self._update_api_version_from_response(resp)
         return resp
 
-    @_retry_requests  # type: ignore
+    @_retry_requests(idempotent_default=False)  # type: ignore
     def _post_request(
         self, endpoint, additional_headers=None, params=None, data=None, files=None, json_data=None
     ) -> httpx.Response:
@@ -742,7 +827,7 @@ class Firecrest:
         self._update_api_version_from_response(resp)
         return resp
 
-    @_retry_requests  # type: ignore
+    @_retry_requests(idempotent_default=False)  # type: ignore
     def _put_request(
         self, endpoint, additional_headers=None, data=None, json_data=None
     ) -> httpx.Response:
@@ -766,7 +851,7 @@ class Firecrest:
         self._update_api_version_from_response(resp)
         return resp
 
-    @_retry_requests  # type: ignore
+    @_retry_requests(idempotent_default=False)  # type: ignore
     def _delete_request(
         self, endpoint, additional_headers=None, params=None, data=None
     ) -> httpx.Response:
@@ -1125,6 +1210,7 @@ class Firecrest:
         }
         resp = self._put_request(
             endpoint=f"/filesystem/{system_name}/ops/chmod",
+            idempotent=True,
             json_data=data
         )
         return self._check_response(resp, 200)["output"]
@@ -1154,6 +1240,7 @@ class Firecrest:
         }
         resp = self._put_request(
             endpoint=f"/filesystem/{system_name}/ops/chown",
+            idempotent=True,
             json_data=data
         )
         return self._check_response(resp, 200)["output"]
@@ -1535,6 +1622,8 @@ class Firecrest:
                     check_timeout(i)
                     time.sleep(i)
                     continue
+
+                raise e
 
             state = job[0]["status"]["state"]
             if isinstance(state, list):
@@ -2259,7 +2348,22 @@ class Firecrest:
         """
         resp = self._delete_request(
             endpoint=f"/compute/{system_name}/jobs/{jobid}",
+            idempotent=True,
         )
+        if (
+            resp.status_code == 500 and
+            resp.extensions.get("firecrest_retries", 0) > 0 and
+            "already completing or completed" in _response_message(resp)
+        ):
+            # An earlier attempt (or the job itself) already ended the job,
+            # so the goal of the call is reached
+            self.log(
+                logging.INFO,
+                f"Job {jobid} is already completing or completed, "
+                f"probably cancelled by a previous attempt of the request"
+            )
+            return {}
+
         return self._check_response(resp, 204)
 
     @_with_correlation_id  # type: ignore

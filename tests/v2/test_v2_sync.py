@@ -515,3 +515,232 @@ def test_custom_auth_headers(fc_server):
     )
     client.set_api_version("2.99.0")
     assert client.systems() == data["response"]["systems"]
+
+
+# Retry policy tests
+
+import httpx  # noqa: E402
+from unittest.mock import Mock  # noqa: E402
+from context_v2 import RetryPolicy, RetryRule  # noqa: E402
+
+
+def _no_sleep(policy):
+    for key in list(policy.rules):
+        for rule in policy.rules_for(key):
+            rule.backoff_factor = 0
+            rule.max_backoff = 0
+
+    return policy
+
+
+def _hits(fc_server, path, method=None):
+    return [
+        req for req, _ in fc_server.log
+        if req.path == path and (method is None or req.method == method)
+    ]
+
+
+def _fail_once(fc_server, path, method, status, body=None, headers=None):
+    body = body if body is not None else {"message": f"failure {status}"}
+    fc_server.expect_oneshot_request(path, method=method).respond_with_json(
+        body, status=status, headers=headers
+    )
+
+
+@pytest.fixture
+def retry_client(valid_client):
+    _no_sleep(valid_client.retry_policy)
+    return valid_client
+
+
+def test_retry_transient_status_then_success(retry_client, fc_server):
+    data = read_json_file("v2/responses/systems.json")
+    _fail_once(fc_server, "/status/systems", "GET", 503)
+    _fail_once(fc_server, "/status/systems", "GET", 424)
+    _fail_once(fc_server, "/status/systems", "GET", 502)
+    resp = retry_client.systems()
+    assert resp == data["response"]["systems"]
+    assert len(_hits(fc_server, "/status/systems")) == 4
+
+
+def test_retry_budget_exhausted(retry_client, fc_server):
+    retry_client.retry_policy.rules[503].max_retries = 1
+    _fail_once(fc_server, "/status/systems", "GET", 503)
+    _fail_once(fc_server, "/status/systems", "GET", 503)
+    with pytest.raises(UnexpectedStatusException) as excinfo:
+        retry_client.systems()
+
+    assert len(_hits(fc_server, "/status/systems")) == 2
+    last = excinfo.value.responses[-1]
+    assert last.status_code == 503
+    assert last.extensions["firecrest_retries"] == 1
+
+
+def test_retry_504_only_for_idempotent_requests(retry_client, fc_server):
+    # Reading the job information is safe to repeat
+    _fail_once(fc_server, "/compute/cluster/jobs/1", "GET", 504)
+    resp = retry_client.job_info("cluster", "1")
+    assert isinstance(resp, list)
+    assert len(_hits(fc_server, "/compute/cluster/jobs/1")) == 2
+
+    # The submission may have gone through before the timeout: not retried
+    _fail_once(fc_server, "/compute/cluster/jobs", "POST", 504)
+    with pytest.raises(UnexpectedStatusException) as excinfo:
+        retry_client.submit("cluster", "/path/to/dir", script_str="...")
+
+    assert excinfo.value.responses[-1].status_code == 504
+    assert len(_hits(fc_server, "/compute/cluster/jobs", "POST")) == 1
+
+
+def test_retry_pre_command_status_on_submit(retry_client, fc_server):
+    data = read_json_file("v2/responses/job_submit.json")
+    _fail_once(fc_server, "/compute/cluster/jobs", "POST", 503)
+    resp = retry_client.submit("cluster", "/path/to/dir", script_str="...")
+    assert resp == data["response"]
+    assert len(_hits(fc_server, "/compute/cluster/jobs", "POST")) == 2
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 500, 501])
+def test_no_retry_on_other_statuses(retry_client, fc_server, status):
+    _fail_once(fc_server, "/status/systems", "GET", status)
+    with pytest.raises(UnexpectedStatusException) as excinfo:
+        retry_client.systems()
+
+    assert excinfo.value.responses[-1].status_code == status
+    assert len(_hits(fc_server, "/status/systems")) == 1
+
+
+def test_retry_rule_with_message_pattern(retry_client, fc_server):
+    retry_client.retry_policy.rules[500] = RetryRule(
+        message="exit status:124", backoff_factor=0
+    )
+    _fail_once(fc_server, "/status/systems", "GET", 500,
+               body={"message": "Remote process failed with exit status:124"})
+    retry_client.systems()
+    assert len(_hits(fc_server, "/status/systems")) == 2
+
+    _fail_once(fc_server, "/status/systems", "GET", 500,
+               body={"message": "Remote process failed with exit status:1"})
+    with pytest.raises(UnexpectedStatusException):
+        retry_client.systems()
+
+    assert len(_hits(fc_server, "/status/systems")) == 3
+
+
+def test_retry_rate_limit(retry_client, fc_server):
+    _fail_once(fc_server, "/status/systems", "GET", 429,
+               headers={"Retry-After": "0"})
+    retry_client.systems()
+    assert len(_hits(fc_server, "/status/systems")) == 2
+
+    retry_client.num_retries_rate_limit = 1
+    _fail_once(fc_server, "/status/systems", "GET", 429,
+               headers={"Retry-After": "0"})
+    _fail_once(fc_server, "/status/systems", "GET", 429,
+               headers={"Retry-After": "0"})
+    with pytest.raises(UnexpectedStatusException) as excinfo:
+        retry_client.systems()
+
+    assert excinfo.value.responses[-1].status_code == 429
+    assert len(_hits(fc_server, "/status/systems")) == 4
+
+
+def test_retry_budgets_are_per_rule(retry_client, fc_server):
+    retry_client.retry_policy.rules[503].max_retries = 1
+    retry_client.num_retries_rate_limit = 1
+    _fail_once(fc_server, "/status/systems", "GET", 429,
+               headers={"Retry-After": "0"})
+    _fail_once(fc_server, "/status/systems", "GET", 503)
+    retry_client.systems()
+    assert len(_hits(fc_server, "/status/systems")) == 3
+
+
+def test_retry_transport_errors(retry_client, monkeypatch):
+    rules = retry_client.retry_policy.rules
+    get = Mock(side_effect=httpx.ConnectError("connection refused"))
+    monkeypatch.setattr(retry_client._session, "get", get)
+    with pytest.raises(httpx.ConnectError):
+        retry_client.systems()
+
+    assert get.call_count == 1 + rules[httpx.ConnectError].max_retries
+
+    # A read timeout may have reached the server: a submission is not
+    # repeated...
+    post = Mock(side_effect=httpx.ReadTimeout("timed out"))
+    monkeypatch.setattr(retry_client._session, "post", post)
+    with pytest.raises(httpx.ReadTimeout):
+        retry_client.submit("cluster", "/path/to/dir", script_str="...")
+
+    assert post.call_count == 1
+
+    # ...but a read is
+    get = Mock(side_effect=httpx.ReadTimeout("timed out"))
+    monkeypatch.setattr(retry_client._session, "get", get)
+    with pytest.raises(httpx.ReadTimeout):
+        retry_client.systems()
+
+    assert get.call_count == 1 + rules[httpx.ReadTimeout].max_retries
+
+
+def test_disabled_retry_policy(fc_server):
+    class ValidAuthorization:
+        def get_access_token(self):
+            return "VALID_TOKEN"
+
+    client = Firecrest(
+        firecrest_url=fc_server.url_for("/"),
+        authorization=ValidAuthorization(),
+        retry_policy=RetryPolicy.disabled(),
+    )
+    _fail_once(fc_server, "/status/systems", "GET", 503)
+    with pytest.raises(UnexpectedStatusException):
+        client.systems()
+
+    assert len(_hits(fc_server, "/status/systems")) == 1
+
+
+def test_cancel_job_already_completed_after_retry(retry_client, fc_server):
+    already_done = {
+        "message": "scancel: error: Kill job error on job id 1: "
+                   "Job/step already completing or completed"
+    }
+    _fail_once(fc_server, "/compute/cluster/jobs/1", "DELETE", 504)
+    _fail_once(fc_server, "/compute/cluster/jobs/1", "DELETE", 500,
+               body=already_done)
+    assert retry_client.cancel_job("cluster", "1") == {}
+    assert len(_hits(fc_server, "/compute/cluster/jobs/1", "DELETE")) == 2
+
+    # Without a previous attempt the error is reported as usual
+    _fail_once(fc_server, "/compute/cluster/jobs/1", "DELETE", 500,
+               body=already_done)
+    with pytest.raises(UnexpectedStatusException):
+        retry_client.cancel_job("cluster", "1")
+
+    assert len(_hits(fc_server, "/compute/cluster/jobs/1", "DELETE")) == 3
+
+
+def test_wait_for_job_propagates_errors(retry_client, fc_server):
+    retry_client.retry_policy.rules[503].max_retries = 0
+    _fail_once(fc_server, "/compute/cluster/jobs/1", "GET", 503)
+    with pytest.raises(UnexpectedStatusException) as excinfo:
+        retry_client.wait_for_job("cluster", "1")
+
+    assert excinfo.value.responses[-1].status_code == 503
+
+
+def test_retry_small_upload_keeps_body(retry_client, fc_server, tmp_path):
+    content = b"hello from the retry test"
+    local_file = tmp_path / "file.txt"
+    local_file.write_bytes(content)
+
+    def upload_handler(request: Request):
+        assert request.files["file"].filename == "remote.txt"
+        assert request.files["file"].read() == content
+        return Response(status=204)
+
+    _fail_once(fc_server, "/filesystem/cluster/ops/upload", "POST", 503)
+    fc_server.expect_request(
+        "/filesystem/cluster/ops/upload", method="POST"
+    ).respond_with_handler(upload_handler)
+    retry_client.upload("cluster", local_file, "/home/user", "remote.txt")
+    assert len(_hits(fc_server, "/filesystem/cluster/ops/upload", "POST")) == 2

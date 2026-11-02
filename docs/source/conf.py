@@ -29,6 +29,11 @@ release = firecrest.__version__
 # ones.
 extensions = ['sphinx.ext.autodoc', 'sphinx_click']
 
+# External types used in signatures that have no documentation to link to
+nitpick_ignore = [
+    ('py:class', 'httpx.Response'),
+]
+
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
 

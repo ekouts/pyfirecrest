@@ -10,6 +10,8 @@ from firecrest.v2 import (  # noqa
     Firecrest,
     ExternalDownload,
     ExternalUpload,
+    RetryPolicy,
+    RetryRule,
 )
 from firecrest.FirecrestException import (  # noqa
     NotImplementedOnAPIversion,

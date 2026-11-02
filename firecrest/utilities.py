@@ -52,11 +52,13 @@ def sched_state_running(state):
     )
 
 
-def parse_retry_after(retry_after_header, log_func):
+def parse_retry_after(retry_after_header, log_func, fallback=10):
     """
     Parse the Retry-After header.
 
     :param retry_after_header: The value of the Retry-After header.
+    :param log_func: logging callback ``(level, message)``.
+    :param fallback: the value returned when the header cannot be parsed.
     :return: A non-negative floating point number representing when the retry
     should occur.
     """
@@ -77,7 +79,7 @@ def parse_retry_after(retry_after_header, log_func):
             logging.WARNING,
             f"Could not parse Retry-After header: {retry_after_header}"
         )
-        return 10
+        return fallback
 
 
 def validate_api_version_compatibility():
