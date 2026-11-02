@@ -245,7 +245,14 @@ class RetryPolicy:
         """
         if response is not None:
             keys: List[RuleKey] = [response.status_code]
-            text = _response_text(response)
+            text = (
+                _response_text(response)
+                if any(
+                    rule.message is not None
+                    for rule in self.rules_for(response.status_code)
+                )
+                else ""
+            )
         elif exc is not None:
             keys = self._exception_keys(exc)
             text = str(exc)
