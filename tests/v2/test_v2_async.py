@@ -236,6 +236,36 @@ async def test_view(valid_client):
     assert resp == data["response"]["output"]
 
 
+@pytest.mark.asyncio
+async def test_view_size_and_offset(valid_client, fc_server):
+    data = read_json_file("v2/responses/view.json")
+    seen = []
+
+    def view_handler(request: Request):
+        seen.append(dict(request.args))
+        return Response(
+            json.dumps(data["response"]),
+            status=200,
+            content_type="application/json",
+        )
+
+    fc_server.expect_oneshot_request(
+        "/filesystem/cluster/ops/view", method="GET"
+    ).respond_with_handler(view_handler)
+    resp = await valid_client.view(
+        "cluster", "/home/user/file", size=100, offset=20
+    )
+    assert resp == data["response"]["output"]
+    assert seen == [{"path": "/home/user/file", "size": "100", "offset": "20"}]
+
+    # When not set, the parameters are left to the server's defaults
+    fc_server.expect_oneshot_request(
+        "/filesystem/cluster/ops/view", method="GET"
+    ).respond_with_handler(view_handler)
+    await valid_client.view("cluster", "/home/user/file")
+    assert seen[-1] == {"path": "/home/user/file"}
+
+
 
 @pytest.mark.asyncio
 async def test_stat(valid_client):

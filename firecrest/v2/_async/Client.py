@@ -1141,17 +1141,37 @@ class AsyncFirecrest:
         self,
         system_name: str,
         path: str,
+        size: Optional[int] = None,
+        offset: Optional[int] = None,
     ) -> str:
         """
-        View full file content (up to 5MB files)
+        View the content of a file, or a part of it.
+
+        The server reads at most ``max_ops_file_size`` bytes, a limit
+        configured per system (5 MB in the default configuration). Requests
+        for a bigger ``size`` are rejected. In versions of the API older than
+        2.6.2 the default ``size`` is 5 MB regardless of the limit, so on a
+        system with a smaller limit ``size`` has to be set explicitly.
 
         :param system_name: the system name where the filesystem belongs to
         :param path: the absolute target path of the file
+        :param size: the number of bytes to read, from the start of the file
+                     or from ``offset``. Defaults to the system's
+                     ``max_ops_file_size``.
+        :param offset: the position in the file, in bytes, where the read
+                       starts. Defaults to 0.
         :calls: GET `/filesystem/{system_name}/ops/view`
         """
+        params: dict[str, Any] = {"path": path}
+        if size is not None:
+            params["size"] = size
+
+        if offset is not None:
+            params["offset"] = offset
+
         resp = await self._get_request(
             endpoint=f"/filesystem/{system_name}/ops/view",
-            params={"path": path}
+            params=params
         )
         return self._check_response(resp, 200)["output"]
 
