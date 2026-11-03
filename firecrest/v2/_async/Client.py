@@ -16,6 +16,7 @@ import logging
 import os
 import pathlib
 import ssl
+import time
 import uuid
 
 from packaging.version import InvalidVersion, Version, parse
@@ -26,6 +27,7 @@ import firecrest.types as t
 
 from firecrest.tracing import current_correlation_id, ensure_correlation_id
 from firecrest.v2.retry import RetryPolicy, RetryRule, RuleKey
+from firecrest.v2.stats import RequestStats
 from firecrest.utilities import (
     part_checksum_xml,
     sched_state_completed,
@@ -522,13 +524,20 @@ class AsyncFirecrest:
                          :data:`firecrest.v2.retry.DEFAULT_RETRY_RULES` is used.
                          It is also available (and editable) as the
                          ``retry_policy`` attribute of the client.
+    :param request_stats: the :class:`firecrest.v2.RequestStats` that
+                          counts and records the requests made to the
+                          API. By default every client gets its own;
+                          pass the same object to several clients to
+                          aggregate their requests. It is also
+                          available as the ``request_stats`` attribute
+                          of the client.
     """
 
     TOO_MANY_REQUESTS_CODE = 429
     MAX_DIRECT_UPLOAD_SIZE = 1048576
     MAX_S3_CONNECTIONS = 10
 
-    def _retry_requests(idempotent_default):
+    def _retry_requests(method, idempotent_default):
         """Decorator of the request wrappers. The request is repeated
         according to :attr:`retry_policy`: after every attempt the policy is
         asked whether the response (or the transport error) should be
@@ -539,7 +548,8 @@ class AsyncFirecrest:
         ``idempotent_default``) that is consumed here, not passed to the
         wrapped function, and tells the policy whether the request is safe
         to repeat. The number of retries that were performed is stored in
-        ``response.extensions["firecrest_retries"]``.
+        ``response.extensions["firecrest_retries"]``. Every attempt is
+        recorded in :attr:`request_stats` with the given HTTP ``method``.
         """
         def decorator(func):
             @functools.wraps(func)
@@ -550,9 +560,22 @@ class AsyncFirecrest:
                 policy = client.retry_policy
                 retries: Dict[RuleKey, int] = {}
                 while True:
+                    attempt = sum(retries.values())
+                    started = time.time()
+                    clock = time.perf_counter()
                     try:
                         resp = await func(*args, **kwargs)
                     except Exception as exc:
+                        client.request_stats.add(
+                            method,
+                            endpoint,
+                            params=kwargs.get("params"),
+                            attempt=attempt,
+                            timestamp=started,
+                            duration=time.perf_counter() - clock,
+                            exc=exc,
+                            correlation_id=current_correlation_id.get(),
+                        )
                         match = policy.match(idempotent, exc=exc)
                         if match is None:
                             raise
@@ -580,6 +603,15 @@ class AsyncFirecrest:
                         retries[key] = done + 1
                         continue
 
+                    client.request_stats.add(
+                        method,
+                        endpoint,
+                        params=kwargs.get("params"),
+                        attempt=attempt,
+                        timestamp=started,
+                        duration=time.perf_counter() - clock,
+                        response=resp,
+                    )
                     match = policy.match(idempotent, response=resp)
                     if match is None:
                         break
@@ -621,6 +653,7 @@ class AsyncFirecrest:
         authorization: Any,
         verify: str | bool | ssl.SSLContext = True,
         retry_policy: Optional[RetryPolicy] = None,
+        request_stats: Optional[RequestStats] = None,
     ) -> None:
         self._firecrest_url = firecrest_url.rstrip('/')
         self._authorization = authorization
@@ -645,6 +678,16 @@ class AsyncFirecrest:
         #: ``client.retry_policy.rules[503].max_retries = 10``.
         self.retry_policy: RetryPolicy = (
             retry_policy if retry_policy is not None else RetryPolicy()
+        )
+        #: The :class:`firecrest.v2.RequestStats` of the client: counters
+        #: and a bounded history of every request sent to the API,
+        #: retries included. Inspect ``client.request_stats.total``,
+        #: ``client.request_stats.by_endpoint`` or
+        #: ``client.request_stats.records``, or get everything with
+        #: ``client.request_stats.as_dict()``. Set
+        #: ``client.request_stats.enabled = False`` to stop recording.
+        self.request_stats: RequestStats = (
+            request_stats if request_stats is not None else RequestStats()
         )
         self._api_version: Version = parse("2.6.0")
         # Set to `True` when the user sets the version explicitly, in which
@@ -769,7 +812,7 @@ class AsyncFirecrest:
 
         return headers
 
-    @_retry_requests(idempotent_default=True)  # type: ignore
+    @_retry_requests("GET", idempotent_default=True)  # type: ignore
     async def _get_request(
         self,
         endpoint,
@@ -801,7 +844,7 @@ class AsyncFirecrest:
         self._update_api_version_from_response(resp)
         return resp
 
-    @_retry_requests(idempotent_default=False)  # type: ignore
+    @_retry_requests("POST", idempotent_default=False)  # type: ignore
     async def _post_request(
         self, endpoint, additional_headers=None, params=None, data=None, files=None, json_data=None
     ) -> httpx.Response:
@@ -831,7 +874,7 @@ class AsyncFirecrest:
         self._update_api_version_from_response(resp)
         return resp
 
-    @_retry_requests(idempotent_default=False)  # type: ignore
+    @_retry_requests("PUT", idempotent_default=False)  # type: ignore
     async def _put_request(
         self, endpoint, additional_headers=None, data=None, json_data=None
     ) -> httpx.Response:
@@ -855,7 +898,7 @@ class AsyncFirecrest:
         self._update_api_version_from_response(resp)
         return resp
 
-    @_retry_requests(idempotent_default=False)  # type: ignore
+    @_retry_requests("DELETE", idempotent_default=False)  # type: ignore
     async def _delete_request(
         self, endpoint, additional_headers=None, params=None, data=None
     ) -> httpx.Response:

@@ -22,3 +22,11 @@ The retry policy
 
 .. autodata:: firecrest.v2.retry.DEFAULT_RETRY_RULES
    :no-value:
+
+The request statistics
+**********************
+.. autoclass:: firecrest.v2.RequestStats
+   :members:
+
+.. autoclass:: firecrest.v2.RequestRecord
+   :members:
