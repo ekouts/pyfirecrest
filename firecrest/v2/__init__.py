@@ -20,6 +20,10 @@ from firecrest.v2.retry import (  # noqa
     RetryPolicy,
     RetryRule,
 )
+from firecrest.v2.stats import (  # noqa
+    RequestRecord,
+    RequestStats,
+)
 
 __all__ = [
     "AsyncExternalDownload",
@@ -29,6 +33,8 @@ __all__ = [
     "ExternalDownload",
     "ExternalUpload",
     "Firecrest",
+    "RequestRecord",
+    "RequestStats",
     "RetryPolicy",
     "RetryRule",
 ]

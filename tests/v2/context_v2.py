@@ -10,6 +10,8 @@ from firecrest.v2 import (  # noqa
     Firecrest,
     ExternalDownload,
     ExternalUpload,
+    RequestRecord,
+    RequestStats,
     RetryPolicy,
     RetryRule,
 )

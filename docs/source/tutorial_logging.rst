@@ -52,3 +52,42 @@ When no ID is passed, a random one is generated for the context:
         print(f"correlation ID of the workflow: {cid}")
         client.mkdir("cluster", "/home/user/my-workflow")
         client.submit("cluster", script_local_path="script.sh")
+
+Counting the requests to FirecREST
+==================================
+
+The v2 clients count every HTTP request they send to the API in their ``request_stats`` attribute, a :class:`firecrest.v2.RequestStats` object.
+Retries are counted as separate requests, while the transfers of file content to and from the staging area are not counted.
+Besides the counters, the object keeps a bounded history (1000 requests by default) of what was requested, as :class:`firecrest.v2.RequestRecord` objects:
+
+.. code-block:: Python
+
+    import firecrest as fc
+
+    client = fc.v2.Firecrest(firecrest_url=..., authorization=...)
+    client.systems()
+    client.list_files("cluster", "/home/user")
+
+    stats = client.request_stats
+    print(stats.total)                # 2
+    print(stats.by_endpoint)          # Counter({'GET /status/systems': 1, 'GET /filesystem/cluster/ops/ls': 1})
+    print(stats.by_status)            # Counter({200: 2})
+    for r in stats.records:
+        print(r.method, r.endpoint, r.params, r.status_code, f"{r.duration:.3f}s")
+
+    # Everything as a JSON-serialisable dictionary, e.g. for a dashboard
+    stats.as_dict()
+
+    # Start over
+    stats.reset()
+
+A listener can be registered to be notified of every request as soon as it completes, for example to show the activity of the client in a user interface:
+
+.. code-block:: Python
+
+    client.request_stats.listeners.append(
+        lambda r: print(f"{r.method} {r.endpoint} -> {r.status_code or r.error}")
+    )
+
+The same ``RequestStats`` object can be passed to several clients through the ``request_stats`` argument of their constructors, to aggregate their requests.
+Recording can be switched off with ``client.request_stats.enabled = False``.
