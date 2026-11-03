@@ -1416,7 +1416,8 @@ class AsyncFirecrest:
             self._check_response(resp, 204)
             return None
         except FirecrestException as e:
-            if e.responses[-1].status_code == 408:
+            # Command timeout: 408 for API < 2.6.0, 504 from 2.6.0 on
+            if e.responses[-1].status_code in (408, 504):
                 # Operation took too long, will run it as a transfer job
                 self.log(
                     logging.INFO,
@@ -1482,7 +1483,8 @@ class AsyncFirecrest:
             self._check_response(resp, 204)
             return None
         except FirecrestException as e:
-            if e.responses[-1].status_code == 408:
+            # Command timeout: 408 for API < 2.6.0, 504 from 2.6.0 on
+            if e.responses[-1].status_code in (408, 504):
                 # Operation took too long, will run it as a transfer job
                 self.log(
                     logging.INFO,
@@ -1735,7 +1737,8 @@ class AsyncFirecrest:
             self._check_response(resp, 204)
             return None
         except FirecrestException as e:
-            if e.responses[-1].status_code == 408:
+            # Command timeout: 408 for API < 2.6.0, 504 from 2.6.0 on
+            if e.responses[-1].status_code in (408, 504):
                 self.log(
                     logging.DEBUG,
                     f"The command for the deletion of file {path} "
