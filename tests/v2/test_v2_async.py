@@ -827,3 +827,78 @@ async def test_retry_small_upload_keeps_body(retry_client, fc_server, tmp_path):
     ).respond_with_handler(upload_handler)
     await retry_client.upload("cluster", local_file, "/home/user", "remote.txt")
     assert len(_hits(fc_server, "/filesystem/cluster/ops/upload", "POST")) == 2
+
+
+# The transfer job returned by the `transfer/*` endpoints when an `ops/*`
+# command times out and the client falls back to a job.
+_TRANSFER_JOB = {
+    "transferJob": {
+        "jobId": 27,
+        "system": "cluster",
+        "workingDirectory": "/home/user/.f7t",
+        "logs": {
+            "outputLog": "/home/user/.f7t/.f7t_file_handling_job_27.log",
+            "errorLog": "/home/user/.f7t/.f7t_file_handling_job_27_error.log",
+        },
+    }
+}
+
+
+def _expect_transfer(fc_server, path, method, status):
+    fc_server.expect_oneshot_request(path, method=method).respond_with_json(
+        _TRANSFER_JOB, status=status
+    )
+
+
+# 408 is the command timeout of API < 2.6.0, 504 the one of API >= 2.6.0
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_status", [408, 504])
+async def test_compress_falls_back_to_job_on_timeout(
+    valid_client, fc_server, timeout_status
+):
+    _fail_once(fc_server, "/filesystem/cluster/ops/compress", "POST", timeout_status)
+    _expect_transfer(fc_server, "/filesystem/cluster/transfer/compress", "POST", 201)
+    await valid_client.compress(
+        "cluster", "/home/user/dir", "/home/user/dir.tar.gz", blocking=False
+    )
+    assert len(_hits(fc_server, "/filesystem/cluster/ops/compress", "POST")) == 1
+    assert len(_hits(fc_server, "/filesystem/cluster/transfer/compress", "POST")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_status", [408, 504])
+async def test_extract_falls_back_to_job_on_timeout(
+    valid_client, fc_server, timeout_status
+):
+    _fail_once(fc_server, "/filesystem/cluster/ops/extract", "POST", timeout_status)
+    _expect_transfer(fc_server, "/filesystem/cluster/transfer/extract", "POST", 201)
+    await valid_client.extract(
+        "cluster", "/home/user/dir.tar.gz", "/home/user/dir", blocking=False
+    )
+    assert len(_hits(fc_server, "/filesystem/cluster/ops/extract", "POST")) == 1
+    assert len(_hits(fc_server, "/filesystem/cluster/transfer/extract", "POST")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_status", [408, 504])
+async def test_rm_falls_back_to_job_on_timeout(
+    valid_client, fc_server, timeout_status
+):
+    _fail_once(fc_server, "/filesystem/cluster/ops/rm", "DELETE", timeout_status)
+    _expect_transfer(fc_server, "/filesystem/cluster/transfer/rm", "DELETE", 200)
+    resp = await valid_client.rm("cluster", "/home/user/file", blocking=False)
+    assert resp == _TRANSFER_JOB
+    assert len(_hits(fc_server, "/filesystem/cluster/ops/rm", "DELETE")) == 1
+    assert len(_hits(fc_server, "/filesystem/cluster/transfer/rm", "DELETE")) == 1
+
+
+@pytest.mark.asyncio
+async def test_compress_other_error_is_raised(valid_client, fc_server):
+    _fail_once(fc_server, "/filesystem/cluster/ops/compress", "POST", 403)
+    with pytest.raises(UnexpectedStatusException) as excinfo:
+        await valid_client.compress(
+            "cluster", "/home/user/dir", "/home/user/dir.tar.gz", blocking=False
+        )
+
+    assert excinfo.value.responses[-1].status_code == 403
+    assert len(_hits(fc_server, "/filesystem/cluster/transfer/compress", "POST")) == 0
